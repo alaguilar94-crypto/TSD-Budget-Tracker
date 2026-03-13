@@ -6,6 +6,8 @@
 <title>TSD Food Services — Budget Tracker</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,300;9..144,600;9..144,700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://apis.google.com/js/api.js"></script>
+<script src="https://accounts.google.com/gsi/client"></script>
 <style>
 :root {
   --teal: #1F6B75;
@@ -224,7 +226,22 @@ select.cat-sel:focus{border-color:var(--teal);}
 .size-warn{background:var(--warn2);border:1px solid #f0c4b4;border-radius:6px;padding:8px 12px;font-size:11px;color:var(--warn);margin-bottom:10px;display:none;line-height:1.5;}
 .size-warn.on{display:block;}
 
-@media(max-width:800px){
+/* google auth */
+.btn-gauth{font-family:var(--mono);font-size:10px;font-weight:500;letter-spacing:0.05em;display:flex;align-items:center;gap:6px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.25);color:white;padding:6px 13px;border-radius:5px;cursor:pointer;transition:background .15s;}
+.btn-gauth:hover{background:rgba(255,255,255,0.22);}
+.btn-gauth.signed-in{background:rgba(94,207,219,0.2);border-color:#5ecfdb;}
+.btn-gauth svg{flex-shrink:0;}
+
+/* send to checkbook button */
+.btn-checkbook{font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:0.04em;background:var(--green);color:white;border:none;padding:9px 18px;border-radius:6px;cursor:pointer;display:flex;align-items:center;gap:7px;transition:background .15s;margin-top:12px;width:100%;}
+.btn-checkbook:hover{background:#155e35;}
+.btn-checkbook:disabled{background:var(--ink4);cursor:not-allowed;}
+.btn-checkbook.loading{background:#155e35;pointer-events:none;}
+
+/* checkbook status */
+.checkbook-status{font-size:10px;margin-top:6px;padding:7px 10px;border-radius:5px;display:none;}
+.checkbook-status.ok{display:block;background:var(--green2);color:var(--green);border:1px solid #a8d8b8;}
+.checkbook-status.err{display:block;background:var(--warn2);color:var(--warn);border:1px solid #f0c4b4;}
   .parse-grid,.breakdown-grid,.summary-row{grid-template-columns:1fr;}
   .view{padding:20px 16px;}
   nav{padding:0 16px;}
@@ -238,6 +255,10 @@ select.cat-sel:focus{border-color:var(--teal);}
   <button class="nav-tab active" onclick="showView('parse')" id="tab-parse">Parse Invoice</button>
   <button class="nav-tab" onclick="showView('ledger')" id="tab-ledger">Ledger <span class="nav-badge" id="ledger-count">0</span></button>
   <div class="nav-right">
+    <button class="btn-gauth" id="gauth-btn" onclick="handleAuthClick()">
+      <svg width="14" height="14" viewBox="0 0 48 48"><path fill="#fff" d="M44.5 20H24v8.5h11.8C34.7 33.9 30.1 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21c10.5 0 20-7.6 20-21 0-1.3-.2-2.7-.5-4z" opacity=".9"/></svg>
+      Sign in with Google
+    </button>
     <button class="btn-export-xl" onclick="exportXLSX()">↓ Export XLSX</button>
   </div>
 </nav>
@@ -440,6 +461,7 @@ Schema:
   "invoice_number": "string or null",
   "invoice_date": "YYYY-MM-DD or null",
   "po_number": "string or null",
+  "special_instructions": "string or null — capture any meal description, delivery notes, or special instructions printed on the invoice (e.g. 'Meals for Dinner', 'Meals for Lunch')",
   "line_items": [
     { "description": "string", "item_code": "string or null", "qty": 0, "unit": "string", "unit_price": 0.00, "extended": 0.00 }
   ],
@@ -630,7 +652,13 @@ function renderResult(d, rawText){
     </div>`;
   }
 
-  html += `<button class="btn-commit" onclick="commitToLedger()">+ Add to Ledger</button></div>`;
+  html += `<button class="btn-commit" onclick="commitToLedger()">+ Add to Ledger</button>
+  <button class="btn-checkbook" id="checkbook-btn" onclick="sendToCheckbook()" title="Append invoice total to your live Google Sheet Checkbook">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+    → Send to Checkbook
+  </button>
+  <div class="checkbook-status" id="checkbook-status"></div>
+  </div>`;
 
   c.innerHTML = html;
   c.classList.add('on');
@@ -946,6 +974,189 @@ Bill To: Texas School for the Deaf - Food Services
 Subtotal: $1,124.20  |  Tax: $0.00  |  Freight: $35.00  |  TOTAL: $1,159.20`;
 }
 
+// ─────────────────────────────────────────────
+// GOOGLE SHEETS INTEGRATION
+// ─────────────────────────────────────────────
+const GCONFIG = {
+  clientId:    '271572594712-jh5vu1s540tvvpa7n24muc4cvnipvlq9.apps.googleusercontent.com',
+  sheetId:     '1lrsmvf5eYmfjbYkWsOg2Vba_sF_iYfLm',
+  scope:       'https://www.googleapis.com/auth/spreadsheets',
+  // Vendor → Org 468 req# + vendor sheet tab name
+  vendorMap: {
+    'labatt':         { req:'6-468-005', sheet:'Labatt',         name:'Labatt Food' },
+    'mr. greens':     { req:'6-468-001', sheet:'Mr. Greens',     name:'Mr. Greens'  },
+    'flowers bakery': { req:'6-468-002', sheet:'Flowers Bakery', name:'Flowers Bakery' },
+    'gold star foods':{ req:'6-468-003', sheet:'Gold Star Foods',name:'Gold Star Foods' },
+    'hiland dairy':   { req:'6-468-004', sheet:'Hiland Dairy',   name:'Hiland Dairy' },
+    'heb':            { req:'6-468-006', sheet:'HEB',            name:'HEB' },
+  }
+};
+
+let gTokenClient = null;
+let gAccessToken = null;
+let gSignedIn    = false;
+
+// Called once Google Identity Services script loads
+function initGoogleAuth(){
+  gTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GCONFIG.clientId,
+    scope:     GCONFIG.scope,
+    callback:  (resp) => {
+      if(resp.error){ console.error('OAuth error', resp); return; }
+      gAccessToken = resp.access_token;
+      gSignedIn    = true;
+      const btn = document.getElementById('gauth-btn');
+      btn.textContent = '✓ Google Connected';
+      btn.classList.add('signed-in');
+    }
+  });
+}
+
+function handleAuthClick(){
+  if(!gTokenClient){
+    // Script may not have loaded yet — retry
+    if(window.google?.accounts?.oauth2){
+      initGoogleAuth();
+    } else {
+      alert('Google API not loaded yet — wait a moment and try again.');
+      return;
+    }
+  }
+  if(gSignedIn){
+    // Already signed in — revoke
+    google.accounts.oauth2.revoke(gAccessToken, ()=>{
+      gSignedIn = false; gAccessToken = null;
+      const btn = document.getElementById('gauth-btn');
+      btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 48 48"><path fill="#fff" d="M44.5 20H24v8.5h11.8C34.7 33.9 30.1 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21c10.5 0 20-7.6 20-21 0-1.3-.2-2.7-.5-4z" opacity=".9"/></svg>Sign in with Google`;
+      btn.classList.remove('signed-in');
+    });
+  } else {
+    gTokenClient.requestAccessToken({ prompt:'consent' });
+  }
+}
+
+// Resolve vendor key from parsed vendor string
+function resolveVendor(vendorStr){
+  if(!vendorStr) return null;
+  const key = vendorStr.toLowerCase().trim();
+  // Direct match
+  if(GCONFIG.vendorMap[key]) return GCONFIG.vendorMap[key];
+  // Partial match
+  for(const [k,v] of Object.entries(GCONFIG.vendorMap)){
+    if(key.includes(k) || k.includes(key)) return v;
+  }
+  return null; // unknown vendor — will use Miscellaneous path
+}
+
+// Build the description string matching your existing pattern:
+// "Special Instructions Invoice#XXXXXX"  or  "Vendor Description Invoice#XXXXXX"
+function buildDescription(d){
+  const parts = [];
+  // Prefer special_instructions if captured, otherwise use a generic description
+  if(d.special_instructions) parts.push(d.special_instructions.trim());
+  if(d.invoice_number)        parts.push(`Invoice#${d.invoice_number}`);
+  return parts.join(' ') || `Invoice#${d.invoice_number||'unknown'}`;
+}
+
+// Fetch the last row index of a sheet range (to know where to append)
+async function getLastRow(sheetName, col='A'){
+  // We use append with insertDataOption=INSERT_ROWS which auto-finds last row
+  // No need to fetch — the append API handles it
+  return null;
+}
+
+// Write a row to a sheet tab using the Sheets API values.append
+async function appendRow(sheetName, values){
+  const range = encodeURIComponent(`'${sheetName}'!A:F`);
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${GCONFIG.sheetId}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${gAccessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ values: [values] })
+  });
+  if(!res.ok){
+    const err = await res.json();
+    throw new Error(err.error?.message || `Sheets API error ${res.status}`);
+  }
+  return await res.json();
+}
+
+async function sendToCheckbook(){
+  const btn    = document.getElementById('checkbook-btn');
+  const status = document.getElementById('checkbook-status');
+  status.className = 'checkbook-status';
+  status.style.display = 'none';
+
+  if(!lastParsed){ showCheckbookStatus('err','No parsed invoice — parse one first.'); return; }
+  if(!gSignedIn || !gAccessToken){
+    showCheckbookStatus('err','Sign in with Google first (top right button).');
+    return;
+  }
+
+  const d = lastParsed;
+  if(!d.grand_total){ showCheckbookStatus('err','Invoice has no grand total — cannot send.'); return; }
+
+  btn.classList.add('loading');
+  btn.textContent = '⏳ Sending...';
+
+  try {
+    const vendor   = resolveVendor(d.vendor);
+    const desc     = buildDescription(d);
+    const date     = d.invoice_date || new Date().toISOString().slice(0,10);
+    const amount   = d.grand_total;
+    const reqNum   = vendor?.req || '6-468-008';
+    const vendName = vendor?.name || d.vendor || 'Unknown';
+
+    // ── Row 1: Org 468 ──────────────────────────────
+    // Columns: Req# | Date | Vendor | Basic Description | Cost | (balance formula handled by sheet)
+    await appendRow('Org 468', [reqNum, date, vendName, desc, amount]);
+
+    // ── Row 2: Vendor tab (if mapped) ───────────────
+    // Columns: Date | Amount | (balance formula handled by sheet)
+    let vendorWritten = false;
+    if(vendor?.sheet){
+      await appendRow(vendor.sheet, [date, amount]);
+      vendorWritten = true;
+    }
+
+    const msg = vendorWritten
+      ? `✓ Written to Org 468 + ${vendor.sheet} tab — ${fmtDollar(amount)} on ${date}`
+      : `✓ Written to Org 468 — ${fmtDollar(amount)} on ${date} (vendor tab not found — check vendor name)`;
+
+    showCheckbookStatus('ok', msg);
+
+  } catch(err){
+    showCheckbookStatus('err', 'Sheets error: ' + err.message);
+    console.error(err);
+  } finally {
+    btn.classList.remove('loading');
+    btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>→ Send to Checkbook`;
+  }
+}
+
+function showCheckbookStatus(type, msg){
+  const el = document.getElementById('checkbook-status');
+  if(!el) return;
+  el.textContent = msg;
+  el.className = 'checkbook-status ' + type;
+  el.style.display = 'block';
+}
+
+// Init Google auth once GIS script is ready
+window.addEventListener('load', () => {
+  // Poll until google.accounts is available (script loads async)
+  const poll = setInterval(()=>{
+    if(window.google?.accounts?.oauth2){
+      clearInterval(poll);
+      initGoogleAuth();
+    }
+  }, 200);
+});
+
+// ─────────────────────────────────────────────
 // Init
 updateBadge();
 </script>
